@@ -59,8 +59,16 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -property installationPath
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          $hits = & $dumpbin.FullName /nologo /disasm:nobytes $env:EXE | Select-String -Pattern '\bzmm\d+\b' | Select-Object -First 5
-          if ($hits) { $hits; throw "scrawl.exe uses AVX-512 registers" }
+          # dumpbin labels each function from scrawl.pdb, so name the ones that touch zmm.
+          $fn = '?'; $found = @{}
+          switch -Regex (& $dumpbin.FullName /nologo /disasm:nobytes $env:EXE) {
+            '^(\S.*):$' { $fn = $matches[1]; continue }
+            '\bzmm\d+\b' { $found[$fn] = 1 + $found[$fn] }
+          }
+          if ($found.Count) {
+            $found.GetEnumerator() | Sort-Object Value -Descending | Format-Table -AutoSize Value, Name | Out-String -Width 400
+            throw "scrawl.exe uses AVX-512 registers in $($found.Count) functions"
+          }
 
       - name: scrawl --help runs headless
         run: '& $env:EXE --help'
