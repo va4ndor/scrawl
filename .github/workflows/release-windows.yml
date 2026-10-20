@@ -31,15 +31,8 @@ jobs:
     env:
       TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
       BUILD: --release --locked --target x86_64-pc-windows-msvc
+      OUT: target\x86_64-pc-windows-msvc\release
       EXE: target\x86_64-pc-windows-msvc\release\scrawl.exe
-      # transcribe.cpp's ggml defaults to GGML_NATIVE, which under MSVC probes the runner's CPU and
-      # compiles for it. The runners have AVX-512, so the zip crashed with an illegal instruction
-      # (0xc000001d) on CPUs without it, such as every Intel Core since Alder Lake. Pin an AVX2
-      # floor instead (x86-64-v3: Haswell / Zen 1 and newer).
-      TRANSCRIBE_CMAKE_ARGS: >-
-        -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON
-        -DGGML_AVX_VNNI=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF
-        -DGGML_AVX512_BF16=OFF
     steps:
       - uses: actions/checkout@v5
         with:
@@ -47,35 +40,45 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-x86-64-v3
+          key: release-cpu-variants
           cache-on-failure: true
 
       - run: cargo build ${{ env.BUILD }}
 
-      # The runner can execute AVX-512, so running the exe can't catch a build that needs it.
+      # transcribe.cpp's CPU backend is one ggml-cpu-<tier>.dll per instruction set, picked at
+      # startup for the CPU it runs on, so only the AVX-512 tiers may touch zmm. The runner can
+      # execute AVX-512, so running the build can't catch code that needs it anywhere else.
       # crc32fast and pulp pick their AVX-512 paths only after checking the CPU at runtime.
-      - name: scrawl.exe has no AVX-512 instructions
+      - name: Only the AVX-512 CPU tiers use AVX-512 instructions
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -property installationPath
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          # dumpbin labels each function from scrawl.pdb, so name the ones that touch zmm.
-          $fn = '?'; $found = @{}
-          switch -Regex (& $dumpbin.FullName /nologo /disasm:nobytes $env:EXE) {
-            '^(\S.*):$' { $fn = $matches[1]; continue }
-            '\bzmm\d+\b' { if ($fn -notmatch 'crc32fast|^libpulp_') { $found[$fn] = 1 + $found[$fn] } }
+          $avx512 = '^ggml-cpu-(skylakex|cannonlake|cascadelake|icelake|cooperlake|zen4|sapphirerapids)\.dll$'
+          $binaries = @(Get-Item $env:EXE) + @(Get-ChildItem "$env:OUT\*.dll" | Where-Object Name -notmatch $avx512)
+          if (-not (Get-ChildItem "$env:OUT\ggml-cpu-haswell.dll" -ErrorAction SilentlyContinue)) { throw "no ggml-cpu-haswell.dll in $env:OUT" }
+          $failed = $false
+          foreach ($binary in $binaries) {
+            # dumpbin labels each function from the PDB or exports, so name the ones that touch zmm.
+            $fn = '?'; $found = @{}
+            switch -Regex (& $dumpbin.FullName /nologo /disasm:nobytes $binary.FullName) {
+              '^(\S.*):$' { $fn = $matches[1]; continue }
+              '\bzmm\d+\b' { if ($fn -notmatch 'crc32fast|^libpulp_') { $found[$fn] = 1 + $found[$fn] } }
+            }
+            "$($binary.Name): $($found.Count) functions use AVX-512"
+            if ($found.Count) {
+              $found.GetEnumerator() | Sort-Object Value -Descending | Format-Table -AutoSize Value, Name | Out-String -Width 400
+              $failed = $true
+            }
           }
-          if ($found.Count) {
-            $found.GetEnumerator() | Sort-Object Value -Descending | Format-Table -AutoSize Value, Name | Out-String -Width 400
-            throw "scrawl.exe uses AVX-512 registers in $($found.Count) functions"
-          }
+          if ($failed) { throw "AVX-512 outside the AVX-512 CPU tiers" }
 
       - name: scrawl --help runs headless
         run: '& $env:EXE --help'
 
       # transcribe.cpp builds against the DLL C runtime, so the Visual C++ runtime DLLs scrawl.exe
-      # imports go beside it in the zip (app-local, as Microsoft allows): a fresh Windows has no
+      # and the transcribe.cpp DLLs import go beside them in the zip (app-local, as Microsoft allows): a fresh Windows has no
       # Visual C++ redistributable.
       # A fresh runner has no Scrawl config, so the app opens the welcome window. Scrawl leaves its
       # own windows out of screen captures unless SCRAWL_SHOW_OWN_WINDOWS is set.
@@ -112,7 +115,8 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -property installationPath
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          $deps = & $dumpbin.FullName /nologo /dependents $env:EXE | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          $deps = @(Get-Item $env:EXE) + @(Get-ChildItem "$env:OUT\*.dll") | ForEach-Object { & $dumpbin.FullName /nologo /dependents $_.FullName } |
+            Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() } | Sort-Object -Unique
           "imports:"; $deps
           $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory | Sort-Object FullName -Descending | Select-Object -First 1
           "runtime from $($crt.FullName)"
@@ -136,6 +140,8 @@ jobs:
           $dir = "dist\Scrawl"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item $env:EXE "$dir\scrawl.exe"
+          # transcribe.dll, ggml*.dll, and one ggml-cpu-<tier>.dll per instruction set.
+          Copy-Item "$env:OUT\*.dll" $dir
           Copy-Item runtime\*.dll $dir
           Copy-Item LICENSE "$dir\LICENSE.txt"
           @"

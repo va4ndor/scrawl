@@ -39,7 +39,9 @@ gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "w
 lyon = "1.0.19"
 raw-window-handle = "0.6.2"
 sha2 = "0.10.9"
-transcribe-cpp = "=0.2.4"
+# One ggml CPU backend per instruction set (AVX2, AVX-512, ...) as DLLs beside scrawl.exe, picked at
+# startup by init_backends_default for the CPU it runs on, instead of one build for the CI runner's.
+transcribe-cpp = { version = "=0.2.4", default-features = false, features = ["dynamic-backends"] }
 tray-icon = { version = "0.24.1", default-features = false }
 windows = { version = "0.61.3", features = [
   "Wdk_System_SystemServices",
