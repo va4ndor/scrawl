@@ -53,6 +53,7 @@ jobs:
       - run: cargo build ${{ env.BUILD }}
 
       # The runner can execute AVX-512, so running the exe can't catch a build that needs it.
+      # crc32fast and pulp pick their AVX-512 paths only after checking the CPU at runtime.
       - name: scrawl.exe has no AVX-512 instructions
         shell: pwsh
         run: |
@@ -63,7 +64,7 @@ jobs:
           $fn = '?'; $found = @{}
           switch -Regex (& $dumpbin.FullName /nologo /disasm:nobytes $env:EXE) {
             '^(\S.*):$' { $fn = $matches[1]; continue }
-            '\bzmm\d+\b' { $found[$fn] = 1 + $found[$fn] }
+            '\bzmm\d+\b' { if ($fn -notmatch 'crc32fast|^libpulp_') { $found[$fn] = 1 + $found[$fn] } }
           }
           if ($found.Count) {
             $found.GetEnumerator() | Sort-Object Value -Descending | Format-Table -AutoSize Value, Name | Out-String -Width 400
