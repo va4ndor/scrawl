@@ -32,6 +32,14 @@ jobs:
       TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
       BUILD: --release --locked --target x86_64-pc-windows-msvc
       EXE: target\x86_64-pc-windows-msvc\release\scrawl.exe
+      # transcribe.cpp's ggml defaults to GGML_NATIVE, which under MSVC probes the runner's CPU and
+      # compiles for it. The runners have AVX-512, so the zip crashed with an illegal instruction
+      # (0xc000001d) on CPUs without it, such as every Intel Core since Alder Lake. Pin an AVX2
+      # floor instead (x86-64-v3: Haswell / Zen 1 and newer).
+      TRANSCRIBE_CMAKE_ARGS: >-
+        -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON
+        -DGGML_AVX_VNNI=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF
+        -DGGML_AVX512_BF16=OFF
     steps:
       - uses: actions/checkout@v5
         with:
@@ -39,10 +47,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release
+          key: release-x86-64-v3
           cache-on-failure: true
 
       - run: cargo build ${{ env.BUILD }}
+
+      # The runner can execute AVX-512, so running the exe can't catch a build that needs it.
+      - name: scrawl.exe has no AVX-512 instructions
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $hits = & $dumpbin.FullName /nologo /disasm:nobytes $env:EXE | Select-String -Pattern '\bzmm\d+\b' | Select-Object -First 5
+          if ($hits) { $hits; throw "scrawl.exe uses AVX-512 registers" }
 
       - name: scrawl --help runs headless
         run: '& $env:EXE --help'
